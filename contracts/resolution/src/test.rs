@@ -1641,4 +1641,117 @@ fn unchallenged_finalize_refunds_full_bond() {
     assert_eq!(balance(&env, &token, &proposer), BOND);
     assert_eq!(balance(&env, &token, &this), 0);
 }
+
+// ── Issue #1025: appeal enforces MAX_APPEAL_ROUNDS and Challenged-only ────────
+
+/// `appeal` on a `Proposed` (never challenged) candidate must be rejected
+/// with `CandidateNotChallenged`.
+#[test]
+fn appeal_on_proposed_candidate_returns_candidate_not_challenged() {
+    let env = Env::default();
+    let (client, _, _, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let candidate_id = client.propose(
+        &proposer,
+        &1u32,
+        &true,
+        &signature(&env),
+        &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
+        &evidence(&env),
+        &MIN_WINDOW,
+        &BOND,
+    );
+
+    let err = client
+        .try_appeal(
+            &proposer,
+            &candidate_id,
+            &true,
+            &signature(&env),
+            &evidence(&env),
+            &MIN_WINDOW,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::CandidateNotChallenged);
+
+    // No state was mutated by the rejected call.
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    assert_eq!(candidate.appeal_round, 0);
+}
+
+/// After `MAX_APPEAL_ROUNDS` successful challenge/appeal cycles, the next
+/// `appeal` must return `AppealLimitExceeded` and `appeal_round` must stay
+/// pinned at `MAX_APPEAL_ROUNDS`.
+#[test]
+fn appeal_enforces_max_appeal_rounds_cap() {
+    let env = Env::default();
+    let (client, _, _, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let challenger = Address::generate(&env);
+    fund(
+        &env,
+        &token,
+        &challenger,
+        BOND * (crate::MAX_APPEAL_ROUNDS as i128 + 1),
+    );
+
+    // Propose once; every challenge/appeal cycle below re-verifies and resets
+    // this same candidate back to `Proposed` without advancing ledger time,
+    // so the fixed signature/challenge-window expiry stays valid throughout.
+    let candidate_id = client.propose(
+        &proposer,
+        &1u32,
+        &true,
+        &signature(&env),
+        &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
+        &evidence(&env),
+        &MIN_WINDOW,
+        &BOND,
+    );
+
+    for round in 0..crate::MAX_APPEAL_ROUNDS {
+        client.challenge(&challenger, &candidate_id, &evidence(&env), &BOND);
+        client.appeal(
+            &proposer,
+            &candidate_id,
+            &true,
+            &signature(&env),
+            &evidence(&env),
+            &MIN_WINDOW,
+        );
+
+        let candidate = client.get_candidate(&candidate_id).unwrap();
+        assert_eq!(candidate.appeal_round, round + 1);
+        assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    }
+
+    // Challenge once more so the candidate is `Challenged` at the cap, then
+    // the next `appeal` must be rejected.
+    client.challenge(&challenger, &candidate_id, &evidence(&env), &BOND);
+
+    let err = client
+        .try_appeal(
+            &proposer,
+            &candidate_id,
+            &true,
+            &signature(&env),
+            &evidence(&env),
+            &MIN_WINDOW,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::AppealLimitExceeded);
+
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.appeal_round, crate::MAX_APPEAL_ROUNDS);
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Challenged);
+}
 }
